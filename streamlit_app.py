@@ -1,10 +1,11 @@
 from pathlib import Path
 from typing import Dict, List
 
+import hashlib
 import math
+
 import pandas as pd
 import streamlit as st
-import hashlib
 
 st.set_page_config(
     page_title="Portfolio Tracker & Analysis",
@@ -13,14 +14,11 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-
-# -----------------------------------------------------------------------------
-# Data loading
+TRADING_DAYS_52W = 252
 
 
 @st.cache_data
 def load_ticker_universe() -> Dict[str, List[str]]:
-    """Load static ticker universes from local CSV files."""
     universes = {}
     for name, file_name in {
         "CDAX": "cdax_tickers.csv",
@@ -48,204 +46,162 @@ def get_gdp_data() -> pd.DataFrame:
     return gdp_df
 
 
-# -----------------------------------------------------------------------------
-# Stock scoring logic
+def make_demo_price_history(ticker: str, periods: int = 330) -> pd.Series:
+    """Deterministic pseudo-price series for offline/demo mode.
 
-SCORING_RULES = {
-    "Revenue Growth 3Y %": [5, 10, 15, 20],
-    "EPS Growth 3Y %": [5, 10, 15, 20],
-    "ROE %": [10, 15, 20, 25],
-    "Gross Margin %": [30, 40, 50, 60],
-    "FCF Margin %": [5, 10, 15, 20],
-    "Debt / Equity": [2.0, 1.2, 0.8, 0.4],
-    "Forward PE": [40, 30, 22, 15],
-}
+    This keeps the app functional where external market APIs are blocked.
+    """
+    seed = int(hashlib.sha256(ticker.encode()).hexdigest()[:8], 16)
+    start_price = 20 + (seed % 140)
+    drift = ((seed >> 5) % 40 - 12) / 10_000
 
-SCORING_WEIGHTS = {
-    "Revenue Growth 3Y %": 0.2,
-    "EPS Growth 3Y %": 0.2,
-    "ROE %": 0.15,
-    "Gross Margin %": 0.1,
-    "FCF Margin %": 0.15,
-    "Debt / Equity": 0.1,
-    "Forward PE": 0.1,
-}
+    values = [float(start_price)]
+    for i in range(1, periods):
+        cyc = math.sin((i + (seed % 17)) / 17) * 0.007
+        noise = (((seed >> (i % 20)) & 31) - 15) / 10_000
+        ret = drift + cyc + noise
+        values.append(max(1.0, values[-1] * (1 + ret)))
+
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=periods)
+    return pd.Series(values, index=idx, name=ticker)
 
 
-def compute_growth_from_series(series: pd.Series, years: int = 3) -> float | None:
-    series = series.dropna().sort_index()
-    if len(series) < years + 1:
-        return None
+def calc_turbo_metrics(close: pd.Series) -> dict[str, float | None]:
+    """Compute the three Turbo-Depot metrics from a close series.
 
-    start = series.iloc[-(years + 1)]
-    end = series.iloc[-1]
-    if start <= 0:
-        return None
+    - SMA-Ratio = (SMA20 / SMA200 - 1) * 100
+    - Delta-SMA = (SMA200_today / SMA200_20d_ago - 1) * 100
+    - 52-WHTR = (Close / 52W_High) + 0.25 * (Close / 52W_Low)
+      (distance to 52W-Low intentionally weighted at 25%)
+    """
+    if close.dropna().shape[0] < 220:
+        return {"SMA-Ratio %": None, "Delta-SMA %": None, "52-WHTR": None}
 
-    return (end / start - 1) * 100
+    sma20 = close.rolling(20).mean()
+    sma200 = close.rolling(200).mean()
 
+    last_close = close.iloc[-1]
+    last_sma20 = sma20.iloc[-1]
+    last_sma200 = sma200.iloc[-1]
+    sma200_20d_ago = sma200.shift(20).iloc[-1]
 
-def metric_to_score(metric: str, value: float | None) -> float:
-    if value is None or pd.isna(value):
-        return 0
+    high_52w = close.tail(TRADING_DAYS_52W).max()
+    low_52w = close.tail(TRADING_DAYS_52W).min()
 
-    thresholds = SCORING_RULES[metric]
-    if metric in {"Debt / Equity", "Forward PE"}:  # lower is better
-        if value <= thresholds[3]:
-            return 5
-        if value <= thresholds[2]:
-            return 4
-        if value <= thresholds[1]:
-            return 3
-        if value <= thresholds[0]:
-            return 2
-        return 1
+    sma_ratio = None
+    if pd.notna(last_sma20) and pd.notna(last_sma200) and last_sma200 != 0:
+        sma_ratio = (last_sma20 / last_sma200 - 1) * 100
 
-    if value >= thresholds[3]:
-        return 5
-    if value >= thresholds[2]:
-        return 4
-    if value >= thresholds[1]:
-        return 3
-    if value >= thresholds[0]:
-        return 2
-    return 1
+    delta_sma = None
+    if pd.notna(last_sma200) and pd.notna(sma200_20d_ago) and sma200_20d_ago != 0:
+        delta_sma = (last_sma200 / sma200_20d_ago - 1) * 100
 
+    wht_ratio = None
+    if pd.notna(last_close) and pd.notna(high_52w) and pd.notna(low_52w) and high_52w > 0 and low_52w > 0:
+        wht_ratio = (last_close / high_52w) + 0.25 * (last_close / low_52w)
 
-def score_to_grade(total_score: float) -> str:
-    if total_score >= 4.5:
-        return "A+"
-    if total_score >= 4.0:
-        return "A"
-    if total_score >= 3.5:
-        return "B"
-    if total_score >= 3.0:
-        return "C"
-    if total_score >= 2.0:
-        return "D"
-    return "E"
+    return {
+        "SMA-Ratio %": sma_ratio,
+        "Delta-SMA %": delta_sma,
+        "52-WHTR": wht_ratio,
+    }
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_scored_stocks(tickers: tuple[str, ...]) -> pd.DataFrame:
-    """Build a scored table using deterministic offline metrics per ticker.
-
-    In environments without market-data API access, this keeps the app usable.
-    Replace this with a live provider integration later if needed.
-    """
+def build_turbo_ranking(tickers: tuple[str, ...]) -> pd.DataFrame:
     rows = []
 
     for ticker in tickers:
-        seed = int(hashlib.sha256(ticker.encode()).hexdigest()[:8], 16)
-
-        def scale(min_v: float, max_v: float, shift: int) -> float:
-            value = ((seed >> shift) & 1023) / 1023
-            return min_v + (max_v - min_v) * value
-
-        row = {
-            "Ticker": ticker,
-            "Name": ticker,
-            "Revenue Growth 3Y %": round(scale(-5, 35, 0), 2),
-            "EPS Growth 3Y %": round(scale(-10, 40, 3), 2),
-            "ROE %": round(scale(2, 35, 6), 2),
-            "Gross Margin %": round(scale(15, 75, 9), 2),
-            "FCF Margin %": round(scale(-5, 30, 12), 2),
-            "Debt / Equity": round(scale(0.0, 2.5, 15), 2),
-            "Forward PE": round(scale(8, 55, 18), 2),
-            "Market Cap": int(scale(1e9, 3e12, 21)),
-        }
-
-        metric_scores = []
-        for metric, weight in SCORING_WEIGHTS.items():
-            s = metric_to_score(metric, row.get(metric))
-            row[f"Score:{metric}"] = s
-            metric_scores.append(s * weight)
-
-        total = sum(metric_scores)
-        row["Score"] = round(total, 2)
-        row["Grade"] = score_to_grade(total)
-        rows.append(row)
+        close = make_demo_price_history(ticker)
+        metrics = calc_turbo_metrics(close)
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Close": round(float(close.iloc[-1]), 2),
+                "SMA20": round(float(close.rolling(20).mean().iloc[-1]), 2),
+                "SMA200": round(float(close.rolling(200).mean().iloc[-1]), 2),
+                "52W High": round(float(close.tail(TRADING_DAYS_52W).max()), 2),
+                "52W Low": round(float(close.tail(TRADING_DAYS_52W).min()), 2),
+                **metrics,
+            }
+        )
 
     df = pd.DataFrame(rows)
-    return df.sort_values(by=["Score", "Market Cap"], ascending=[False, False])
 
+    for metric in ["SMA-Ratio %", "Delta-SMA %", "52-WHTR"]:
+        df[f"Rank {metric}"] = df[metric].rank(ascending=False, method="min")
 
-# -----------------------------------------------------------------------------
-# UI
+    df["Avg Rank"] = df[["Rank SMA-Ratio %", "Rank Delta-SMA %", "Rank 52-WHTR"]].mean(axis=1)
+    df["Final Rank"] = df["Avg Rank"].rank(ascending=True, method="min").astype(int)
+
+    return df.sort_values(["Final Rank", "Avg Rank", "Ticker"], ascending=[True, True, True])
+
 
 st.title("Stock Portfolio Tracker & Analysis")
 st.caption(
-    "Page 1 shows CDAX and Nasdaq-100 tables, graded and sorted with a transparent KPI model inspired by Turbo-Depot style ranking."
+    "Erste Seite mit CDAX- und Nasdaq-100-Ranglisten nach der Turbo-Depot-Logik: "
+    "SMA-Ratio, Delta-SMA und 52-WHTR, dann Durchschnittsrang und finaler Rang."
 )
 
 stock_tab, gdp_tab = st.tabs(["Stock Ranking", "GDP Dashboard (legacy)"])
 
 with stock_tab:
-    st.subheader("Universe ranking")
+    st.subheader("Turbo-Depot Rangliste")
     st.write(
-        "The score combines growth, quality, profitability and valuation metrics. You can tune the universe size to reduce loading time."
+        "Pro Index werden alle Aktien relativ bewertet: je Kennzahl ein Rang, dann Durchschnittsrang, "
+        "anschließend finaler Rang (1 = beste Aktie)."
     )
 
     universes = load_ticker_universe()
     c1, c2 = st.columns(2)
     with c1:
-        cdax_limit = st.slider("CDAX tickers to load", min_value=10, max_value=len(universes["CDAX"]), value=30)
+        cdax_limit = st.slider("CDAX Titel", min_value=10, max_value=len(universes["CDAX"]), value=40)
     with c2:
-        ndx_limit = st.slider("Nasdaq-100 tickers to load", min_value=10, max_value=len(universes["Nasdaq-100"]), value=40)
+        ndx_limit = st.slider("Nasdaq-100 Titel", min_value=10, max_value=len(universes["Nasdaq-100"]), value=40)
 
-    with st.expander("Scoring model"):
-        st.json({"thresholds": SCORING_RULES, "weights": SCORING_WEIGHTS})
-        st.caption("Note: In this offline environment, metrics are deterministic demo values derived from ticker symbols. Connect a live data source for production use.")
+    with st.expander("Formeln & Hinweise"):
+        st.markdown(
+            """
+            - **SMA-Ratio** = \((SMA20 / SMA200) - 1\) \* 100
+            - **Delta-SMA** = \((SMA200\_heute / SMA200\_vor\_20T) - 1\) \* 100
+            - **52-WHTR** = \((Kurs / 52W\_Hoch) + 0.25 \* (Kurs / 52W\_Tief)\)
 
-    cdax_df = get_scored_stocks(tuple(universes["CDAX"][:cdax_limit]))
-    ndx_df = get_scored_stocks(tuple(universes["Nasdaq-100"][:ndx_limit]))
+            Danach je Kennzahl Rang (absteigend), dann Durchschnittsrang und finaler Rang.
+            """
+        )
+        st.caption(
+            "Hinweis: Externe Kursdaten sind in dieser Umgebung nicht erreichbar. "
+            "Daher werden reproduzierbare Demo-Kursreihen pro Ticker genutzt."
+        )
+
+    cdax_df = build_turbo_ranking(tuple(universes["CDAX"][:cdax_limit]))
+    ndx_df = build_turbo_ranking(tuple(universes["Nasdaq-100"][:ndx_limit]))
+
+    display_cols = [
+        "Final Rank",
+        "Avg Rank",
+        "Ticker",
+        "SMA-Ratio %",
+        "Rank SMA-Ratio %",
+        "Delta-SMA %",
+        "Rank Delta-SMA %",
+        "52-WHTR",
+        "Rank 52-WHTR",
+        "Close",
+        "SMA20",
+        "SMA200",
+        "52W High",
+        "52W Low",
+    ]
 
     tc1, tc2 = st.columns(2)
     with tc1:
         st.markdown("#### CDAX")
-        if cdax_df.empty:
-            st.warning("No CDAX rows could be loaded. Data provider may be temporarily unavailable.")
-        else:
-            st.dataframe(
-                cdax_df[[
-                    "Grade",
-                    "Score",
-                    "Ticker",
-                    "Name",
-                    "Revenue Growth 3Y %",
-                    "EPS Growth 3Y %",
-                    "ROE %",
-                    "Gross Margin %",
-                    "FCF Margin %",
-                    "Debt / Equity",
-                    "Forward PE",
-                ]],
-                width="stretch",
-                hide_index=True,
-            )
+        st.dataframe(cdax_df[display_cols], width="stretch", hide_index=True)
 
     with tc2:
         st.markdown("#### Nasdaq-100")
-        if ndx_df.empty:
-            st.warning("No Nasdaq-100 rows could be loaded. Data provider may be temporarily unavailable.")
-        else:
-            st.dataframe(
-                ndx_df[[
-                    "Grade",
-                    "Score",
-                    "Ticker",
-                    "Name",
-                    "Revenue Growth 3Y %",
-                    "EPS Growth 3Y %",
-                    "ROE %",
-                    "Gross Margin %",
-                    "FCF Margin %",
-                    "Debt / Equity",
-                    "Forward PE",
-                ]],
-                width="stretch",
-                hide_index=True,
-            )
+        st.dataframe(ndx_df[display_cols], width="stretch", hide_index=True)
 
 with gdp_tab:
     gdp_df = get_gdp_data()
